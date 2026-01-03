@@ -15,7 +15,10 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from config import INCLUDE_SENDER_INFO, SENDER_FORMAT, DEFAULT_TOPIC_ID
+from database import Database
+import admin
+from admin import init_admin, get_admin_conversation_handler
+from migrate import run_migrations
 
 # Настройка логирования
 logging.basicConfig(
@@ -28,37 +31,66 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-SOURCE_CHAT_ID = os.getenv('SOURCE_CHAT_ID')  # Обратная совместимость
-SOURCE_CHAT_IDS = os.getenv('SOURCE_CHAT_IDS')  # Новый формат для нескольких чатов
-TARGET_CHAT_ID = os.getenv('TARGET_CHAT_ID')
-TOPIC_ROUTING_STR = os.getenv('TOPIC_ROUTING', '')
+DATABASE_URL = os.getenv('DATABASE_URL')
+ADMIN_IDS_STR = os.getenv('ADMIN_IDS', '')
 
-# Парсинг списка исходных чатов
-SOURCE_CHATS = set()
-if SOURCE_CHAT_IDS:
-    # Новый формат: несколько ID через запятую
-    for chat_id in SOURCE_CHAT_IDS.split(','):
-        chat_id = chat_id.strip()
-        if chat_id:
-            SOURCE_CHATS.add(chat_id)
-elif SOURCE_CHAT_ID:
-    # Старый формат: один ID для обратной совместимости
-    SOURCE_CHATS.add(SOURCE_CHAT_ID)
+# Парсинг ID администраторов
+ADMIN_IDS = set()
+if ADMIN_IDS_STR:
+    for admin_id in ADMIN_IDS_STR.split(','):
+        admin_id = admin_id.strip()
+        if admin_id.isdigit():
+            ADMIN_IDS.add(int(admin_id))
 
-# Парсинг маршрутизации префиксов к темам
+# Глобальный объект базы данных
+db: Database = None
+
+# Кэш данных из БД (обновляется при старте и по необходимости)
 TOPIC_ROUTING = {}
-if TOPIC_ROUTING_STR:
-    for route in TOPIC_ROUTING_STR.split(','):
-        route = route.strip()
-        if ':' in route:
-            prefix, topic_id = route.split(':', 1)
-            TOPIC_ROUTING[prefix.lower()] = int(topic_id)
+TOPIC_NAMES = {}
+SOURCE_CHATS = set()
+TARGET_CHAT_ID = None
+INCLUDE_SENDER_INFO = True
+SENDER_FORMAT = "{message}\nОтправил: {sender_name} ({sender_username})"
+DEFAULT_TOPIC_ID = None
+
+
+async def load_data_from_db():
+    """Загружает данные из базы данных в кэш."""
+    global TOPIC_ROUTING, TOPIC_NAMES, SOURCE_CHATS, TARGET_CHAT_ID
+    global INCLUDE_SENDER_INFO, SENDER_FORMAT, db
+
+    if db is None:
+        logger.error("База данных не инициализирована!")
+        return
+
+    logger.info("Загрузка данных из базы данных...")
+
+    # Загрузка топиков
+    TOPIC_ROUTING = await db.get_topics()
+    TOPIC_NAMES = await db.get_topic_names()
+
+    # Загрузка исходных чатов
+    SOURCE_CHATS = await db.get_source_chats()
+
+    # Загрузка конфигурации
+    config = await db.get_all_config()
+    TARGET_CHAT_ID = config.get('target_chat_id')
+    INCLUDE_SENDER_INFO = config.get('include_sender_info', 'true').lower() == 'true'
+    SENDER_FORMAT = config.get('sender_format', SENDER_FORMAT)
+
+    logger.info(f"Загружено топиков: {len(TOPIC_ROUTING)}")
+    logger.info(f"Загружено исходных чатов: {len(SOURCE_CHATS)}")
+    logger.info(f"Целевой чат: {TARGET_CHAT_ID}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Обрабатывает входящие сообщения и перенаправляет их при необходимости.
     """
+    # Логируем update если включен дебаг-режим
+    admin.log_update_to_file(update)
+
     message = update.message
 
     if not message or not message.text:
@@ -86,9 +118,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # Проверяем, известен ли префикс
         if prefix not in TOPIC_ROUTING:
-            # Формируем список доступных префиксов
-            available_prefixes = ', '.join([f'/{p}' for p in sorted(TOPIC_ROUTING.keys())])
-            response_text = f"Такой темы нет, список доступных: {available_prefixes}"
+            # Формируем список доступных префиксов с названиями (если есть)
+            if TOPIC_NAMES:
+                # Показываем маппинг: цифра → название
+                available_list = []
+                for p in sorted(TOPIC_ROUTING.keys()):
+                    name = TOPIC_NAMES.get(p, p)
+                    available_list.append(f"/{p} → {name}")
+                response_text = "Такой темы нет, список доступных:\n" + "\n".join(available_list)
+            else:
+                # Простой список префиксов
+                available_prefixes = ', '.join([f'/{p}' for p in sorted(TOPIC_ROUTING.keys())])
+                response_text = f"Такой темы нет, список доступных: {available_prefixes}"
 
             # Отправляем ответ в исходный чат
             await context.bot.send_message(
@@ -152,6 +193,35 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error(f"Произошла ошибка: {context.error}")
 
 
+async def post_init(application: Application) -> None:
+    """Инициализация после создания приложения."""
+    global db
+
+    # Запуск миграций
+    logger.info("Запуск миграций базы данных...")
+    try:
+        run_migrations()
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении миграций: {e}", exc_info=True)
+        raise
+
+    # Подключение к базе данных
+    db = Database(DATABASE_URL)
+    await db.connect()
+
+    # Инициализация админ-панели
+    init_admin(db, ADMIN_IDS)
+
+    # Загрузка данных из БД
+    await load_data_from_db()
+
+
+async def post_shutdown(application: Application) -> None:
+    """Очистка ресурсов при завершении."""
+    if db:
+        await db.close()
+
+
 def main() -> None:
     """
     Запускает бота.
@@ -159,28 +229,24 @@ def main() -> None:
     # Проверка наличия необходимых переменных окружения
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не установлен в .env файле")
-    if not SOURCE_CHATS:
-        raise ValueError("SOURCE_CHAT_ID или SOURCE_CHAT_IDS не установлен в .env файле")
-    if not TARGET_CHAT_ID:
-        raise ValueError("TARGET_CHAT_ID не установлен в .env файле")
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL не установлен в .env файле")
 
     logger.info("Запуск бота...")
-    logger.info(f"Исходные чаты ID: {', '.join(SOURCE_CHATS)}")
-    logger.info(f"Целевой чат ID: {TARGET_CHAT_ID}")
-    logger.info(f"Маршрутизация префиксов к темам: {TOPIC_ROUTING}")
-    logger.info(f"Тема по умолчанию: {DEFAULT_TOPIC_ID}")
 
     # Создание приложения
     application = Application.builder().token(BOT_TOKEN).build()
 
+    # Регистрация функций инициализации и завершения
+    application.post_init = post_init
+    application.post_shutdown = post_shutdown
+
+    # Регистрация админ-обработчиков
+    application.add_handler(get_admin_conversation_handler())
+
     # Регистрация обработчиков
     # Фильтр для текстовых сообщений из групп и приватных чатов
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,  # Все текстовые сообщения (включая те, что начинаются с "/")
-            handle_message
-        )
-    )
+#
 
     # Также обрабатываем команды отдельно
     application.add_handler(

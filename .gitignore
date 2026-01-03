@@ -9,3 +9,4 @@ env/
 ENV/
 .idea/
 *.log
+debug_updates.txt
