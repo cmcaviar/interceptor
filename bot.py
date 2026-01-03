@@ -28,9 +28,22 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-SOURCE_CHAT_ID = os.getenv('SOURCE_CHAT_ID')
+SOURCE_CHAT_ID = os.getenv('SOURCE_CHAT_ID')  # Обратная совместимость
+SOURCE_CHAT_IDS = os.getenv('SOURCE_CHAT_IDS')  # Новый формат для нескольких чатов
 TARGET_CHAT_ID = os.getenv('TARGET_CHAT_ID')
 TOPIC_ROUTING_STR = os.getenv('TOPIC_ROUTING', '')
+
+# Парсинг списка исходных чатов
+SOURCE_CHATS = set()
+if SOURCE_CHAT_IDS:
+    # Новый формат: несколько ID через запятую
+    for chat_id in SOURCE_CHAT_IDS.split(','):
+        chat_id = chat_id.strip()
+        if chat_id:
+            SOURCE_CHATS.add(chat_id)
+elif SOURCE_CHAT_ID:
+    # Старый формат: один ID для обратной совместимости
+    SOURCE_CHATS.add(SOURCE_CHAT_ID)
 
 # Парсинг маршрутизации префиксов к темам
 TOPIC_ROUTING = {}
@@ -51,8 +64,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not message or not message.text:
         return
 
-    # Проверяем, что сообщение из исходного чата
-    if str(message.chat_id) != SOURCE_CHAT_ID:
+    # Проверяем, что сообщение из одного из исходных чатов
+    if str(message.chat_id) not in SOURCE_CHATS:
         return
 
     # Проверяем, что сообщение начинается с "/"
@@ -146,13 +159,13 @@ def main() -> None:
     # Проверка наличия необходимых переменных окружения
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не установлен в .env файле")
-    if not SOURCE_CHAT_ID:
-        raise ValueError("SOURCE_CHAT_ID не установлен в .env файле")
+    if not SOURCE_CHATS:
+        raise ValueError("SOURCE_CHAT_ID или SOURCE_CHAT_IDS не установлен в .env файле")
     if not TARGET_CHAT_ID:
         raise ValueError("TARGET_CHAT_ID не установлен в .env файле")
 
     logger.info("Запуск бота...")
-    logger.info(f"Исходный чат ID: {SOURCE_CHAT_ID}")
+    logger.info(f"Исходные чаты ID: {', '.join(SOURCE_CHATS)}")
     logger.info(f"Целевой чат ID: {TARGET_CHAT_ID}")
     logger.info(f"Маршрутизация префиксов к темам: {TOPIC_ROUTING}")
     logger.info(f"Тема по умолчанию: {DEFAULT_TOPIC_ID}")
