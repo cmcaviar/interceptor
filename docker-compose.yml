@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  interceptor-bot:
+    build: .
+    container_name: interceptor-bot
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - .:/app
+    working_dir: /app
+    command: python bot.py
+    networks:
+      - bot_net
+
+volumes:
+  pg_data:
+
+networks:
+  bot_net:
+    driver: bridge
