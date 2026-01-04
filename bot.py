@@ -84,13 +84,17 @@ async def load_data_from_db():
     logger.info(f"Целевой чат: {TARGET_CHAT_ID}")
 
 
+async def debug_logger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Универсальный обработчик для логирования всех апдейтов в дебаг-режиме.
+    """
+    admin.log_update_to_file(update)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Обрабатывает входящие сообщения и перенаправляет их при необходимости.
     """
-    # Логируем update если включен дебаг-режим
-    admin.log_update_to_file(update)
-
     message = update.message
 
     if not message or not message.text:
@@ -240,6 +244,13 @@ def main() -> None:
     # Регистрация функций инициализации и завершения
     application.post_init = post_init
     application.post_shutdown = post_shutdown
+
+    # Регистрация обработчика дебага (первым, с максимальным приоритетом, group=-1)
+    # Это позволит логировать ВСЕ апдейты независимо от других обработчиков
+    application.add_handler(
+        MessageHandler(filters.ALL, debug_logger),
+        group=-1
+    )
 
     # Регистрация админ-обработчиков
     application.add_handler(get_admin_conversation_handler())
